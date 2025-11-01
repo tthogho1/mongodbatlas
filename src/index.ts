@@ -3,6 +3,7 @@ import { config } from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Embedding } from './lib/embedding';
+import { MongoClient, Db, Collection } from 'mongodb';
 
 // .envファイルを読み込み
 config();
@@ -16,6 +17,9 @@ interface S3Config {
   modelId: string;
   outputDir: string;
   maxFiles: number;
+  mongodbUri: string;
+  mongodbDbName: string;
+  mongodbCollectionName: string;
 }
 
 interface ImageEmbeddingResult {
@@ -30,6 +34,10 @@ class S3ImageEmbeddingProcessor {
   private config: S3Config;
   private embeddingModel: Embedding;
 
+  private mongoClient: MongoClient | null = null;
+  private mongodb: Db | null = null;
+  private collection: Collection | null = null;
+
   constructor() {
     // 環境変数から設定を読み込み
     this.config = {
@@ -41,6 +49,9 @@ class S3ImageEmbeddingProcessor {
       modelId: process.env.MODEL_ID || 'Xenova/clip-vit-base-patch32',
       outputDir: process.env.OUTPUT_DIR || './embeddings',
       maxFiles: parseInt(process.env.MAX_FILES || '100'),
+      mongodbUri: process.env.MONGODB_URI || '',
+      mongodbDbName: process.env.MONGODB_DB_NAME || 'webcamNew',
+      mongodbCollectionName: process.env.MONGODB_COLLECTION_NAME || 'imageTest',
     };
 
     // 必須設定の検証
@@ -96,6 +107,71 @@ class S3ImageEmbeddingProcessor {
     }
 
     throw new Error('モデルの初期化がタイムアウトしました。');
+  }
+
+  /**
+   * MongoDB Atlasに接続
+   */
+  private async connectToMongoDB(): Promise<void> {
+    try {
+      if (!this.config.mongodbUri) {
+        console.log('MongoDB接続文字列が設定されていません。MongoDB保存をスキップします。');
+        return;
+      }
+
+      console.log('MongoDB Atlasに接続中...');
+      this.mongoClient = new MongoClient(this.config.mongodbUri);
+      await this.mongoClient.connect();
+
+      this.mongodb = this.mongoClient.db(this.config.mongodbDbName);
+      this.collection = this.mongodb.collection(this.config.mongodbCollectionName);
+
+      console.log(
+        `MongoDB接続成功: ${this.config.mongodbDbName}.${this.config.mongodbCollectionName}`
+      );
+
+      // コレクションを空にする
+      const deleteResult = await this.collection.deleteMany({});
+      console.log(`コレクションを空にしました: 削除件数 ${deleteResult.deletedCount}`);
+    } catch (error) {
+      console.error('MongoDB接続エラー:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * MongoDBへの接続を切断
+   */
+  private async disconnectFromMongoDB(): Promise<void> {
+    if (this.mongoClient) {
+      await this.mongoClient.close();
+      console.log('MongoDBから切断しました。');
+    }
+  }
+
+  /**
+   * Embeddingをmongodbに保存
+   */
+  private async saveToMongoDB(result: ImageEmbeddingResult): Promise<void> {
+    if (!this.collection) {
+      return; // MongoDB接続がない場合はスキップ
+    }
+
+    try {
+      const document = {
+        key: result.key,
+        embedding: result.embedding,
+        url: result.url,
+        timestamp: result.timestamp,
+        createdAt: new Date(),
+      };
+
+      await this.collection.insertOne(document);
+      console.log(`MongoDBに保存完了: ${result.key}`);
+    } catch (error) {
+      console.error(`MongoDBへの保存に失敗 (${result.key}):`, error);
+      // エラーが発生しても処理を継続
+    }
   }
 
   /**
@@ -174,6 +250,10 @@ class S3ImageEmbeddingProcessor {
       try {
         const result = await this.processImageEmbedding(key);
         results.push(result);
+
+        // MongoDBに保存
+        await this.saveToMongoDB(result);
+
         console.log(`(${i + 1}/${keys.length}) 完了: ${key}`);
       } catch (error) {
         console.error(`(${i + 1}/${keys.length}) エラー: ${key}`, error);
@@ -257,6 +337,9 @@ class S3ImageEmbeddingProcessor {
       console.log('モデルの初期化を待機中...');
       await this.waitForModelInitialization();
 
+      // MongoDBに接続
+      await this.connectToMongoDB();
+
       // ファイル一覧を取得
       console.log('画像ファイル一覧を取得中...');
       const imageKeys = await this.listFiles();
@@ -291,6 +374,9 @@ class S3ImageEmbeddingProcessor {
     } catch (error) {
       console.error('エラーが発生しました:', error);
       process.exit(1);
+    } finally {
+      // MongoDB接続を切断
+      await this.disconnectFromMongoDB();
     }
   }
 }
