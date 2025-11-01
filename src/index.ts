@@ -129,6 +129,10 @@ class S3ImageEmbeddingProcessor {
       console.log(
         `MongoDB接続成功: ${this.config.mongodbDbName}.${this.config.mongodbCollectionName}`
       );
+
+      // コレクションを空にする
+      const deleteResult = await this.collection.deleteMany({});
+      console.log(`コレクションを空にしました: 削除件数 ${deleteResult.deletedCount}`);
     } catch (error) {
       console.error('MongoDB接続エラー:', error);
       throw error;
